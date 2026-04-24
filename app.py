@@ -7,12 +7,12 @@ import threading
 import razorpay
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
-socketio = SocketIO(app, cors_allowed_origins="*")
+app.secret_key = os.environ.get("SECRET_KEY", "smartpos-secret-key-2024")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 DB_PATH = "instance/smartpos.db"
-RAZORPAY_KEY_ID = "rzp_live_SdPawakd287Evf"
-RAZORPAY_KEY_SECRET = "NJDC8l64PfHHKfTuofH4HKSz"
+RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "rzp_live_SdPawakd287Evf")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "NJDC8l64PfHHKfTuofH4HKSz")
 
 # ── Database ────────────────────────────────────────────────────────────────
 def get_db():
@@ -134,7 +134,10 @@ def collect_system_state(user_id, items):
     state = {}
 
     # 1. Session validity
-    row = conn.execute("SELECT * FROM sessions WHERE user_id=? AND active=1 ORDER BY started_at DESC LIMIT 1", (user_id,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM sessions WHERE user_id=? AND active=1 ORDER BY started_at DESC LIMIT 1",
+        (user_id,)
+    ).fetchone()
     if row:
         last = datetime.fromisoformat(row["last_active"])
         state["session_valid"] = (datetime.utcnow() - last).seconds < 1800
@@ -149,7 +152,9 @@ def collect_system_state(user_id, items):
         if prod:
             if prod["stock"] < item["qty"]:
                 state["inventory_ok"] = False
-                state["inventory_issues"].append(f"{prod['name']}: need {item['qty']}, have {prod['stock']}")
+                state["inventory_issues"].append(
+                    f"{prod['name']}: need {item['qty']}, have {prod['stock']}"
+                )
 
     # 3. Device sync
     dev = conn.execute("SELECT * FROM devices WHERE device_id='DEV-001'").fetchone()
@@ -159,18 +164,18 @@ def collect_system_state(user_id, items):
     else:
         state["device_synced"] = False
 
-    # 4. Cash drawer (simulated)
+    # 4. Cash drawer (simulated - always closed)
     state["cash_drawer_open"] = False
 
     # 5. User active
     user = conn.execute("SELECT * FROM users WHERE id=? AND active=1", (user_id,)).fetchone()
     state["user_active"] = user is not None
 
-    # 6. Total amount check (flag large transactions)
+    # 6. Total amount check (flag large transactions > 2 lakh)
     total = sum(i["price"] * i["qty"] for i in items)
-    state["amount_flagged"] = total > 200000  # Flag if > 2 lakh
+    state["amount_flagged"] = total > 200000
 
-    # 7. Timestamp
+    # 7. Metadata
     state["timestamp"] = datetime.utcnow().isoformat()
     state["total_amount"] = total
 
@@ -179,10 +184,14 @@ def collect_system_state(user_id, items):
 
 # ── Rule Engine ──────────────────────────────────────────────────────────────
 def evaluate_rules(snapshot):
-    """Returns: (decision, reason, hold_conditions)"""
-    reasons = []
+    """
+    Evaluates deterministic rules against the system snapshot.
+    Returns: (decision, reason, hold_conditions)
+    decision: 'allow' | 'hold' | 'block'
+    """
     hold_reasons = []
 
+    # BLOCK conditions - hard stops
     if not snapshot.get("user_active"):
         return "block", "User account is inactive or suspended", []
 
@@ -193,6 +202,7 @@ def evaluate_rules(snapshot):
         issues = ", ".join(snapshot.get("inventory_issues", []))
         return "block", f"Insufficient stock: {issues}", []
 
+    # HOLD conditions - soft stops requiring resolution
     if not snapshot.get("device_synced"):
         hold_reasons.append("POS device not synced with server")
 
@@ -220,14 +230,20 @@ def login():
         data = request.get_json()
         conn = get_db()
         pw = hashlib.sha256(data["password"].encode()).hexdigest()
-        user = conn.execute("SELECT * FROM users WHERE username=? AND password=? AND active=1", (data["username"], pw)).fetchone()
+        user = conn.execute(
+            "SELECT * FROM users WHERE username=? AND password=? AND active=1",
+            (data["username"], pw)
+        ).fetchone()
         if user:
             session["user_id"] = user["id"]
             session["username"] = user["username"]
             session["role"] = user["role"]
             sid = str(uuid.uuid4())
             conn.execute("INSERT INTO sessions (id, user_id) VALUES (?,?)", (sid, user["id"]))
-            conn.execute("UPDATE devices SET last_sync=? WHERE device_id='DEV-001'", (datetime.utcnow().isoformat(),))
+            conn.execute(
+                "UPDATE devices SET last_sync=? WHERE device_id='DEV-001'",
+                (datetime.utcnow().isoformat(),)
+            )
             conn.commit()
             conn.close()
             log_event("LOGIN", None, user["id"], f"User {user['username']} logged in")
@@ -248,7 +264,7 @@ def logout():
     session.clear()
     return redirect(url_for("login"))
 
-# ── POS Route ─────────────────────────────────────────────────────────────────
+# ── Page Routes ───────────────────────────────────────────────────────────────
 @app.route("/pos")
 @login_required
 def pos():
@@ -270,10 +286,8 @@ def get_products():
 
 @app.route("/api/products", methods=["POST"])
 @login_required
-@admin_required
 def create_product():
     data = request.get_json() or {}
-
     name = (data.get("name") or "").strip()
     sku = (data.get("sku") or "").strip().upper()
     category = (data.get("category") or "General").strip() or "General"
@@ -311,7 +325,10 @@ def create_product():
 def update_product(pid):
     data = request.get_json()
     conn = get_db()
-    conn.execute("UPDATE products SET stock=?, price=? WHERE id=?", (data["stock"], data["price"], pid))
+    conn.execute(
+        "UPDATE products SET stock=?, price=? WHERE id=?",
+        (data["stock"], data["price"], pid)
+    )
     conn.commit()
     conn.close()
     return jsonify({"success": True})
@@ -327,16 +344,18 @@ def initiate_transaction():
 
     user_id = session["user_id"]
 
-    # Update session activity
+    # Update session activity timestamp
     conn = get_db()
-    conn.execute("UPDATE sessions SET last_active=? WHERE user_id=? AND active=1",
-                 (datetime.utcnow().isoformat(), user_id))
+    conn.execute(
+        "UPDATE sessions SET last_active=? WHERE user_id=? AND active=1",
+        (datetime.utcnow().isoformat(), user_id)
+    )
     conn.commit()
 
     # Step 3-4: Collect system state snapshot
     snapshot = collect_system_state(user_id, items)
 
-    # Step 5: Evaluate rules
+    # Step 5: Evaluate deterministic rules
     decision, reason, hold_conditions = evaluate_rules(snapshot)
 
     txn_id = str(uuid.uuid4())
@@ -344,21 +363,28 @@ def initiate_transaction():
     tax = round(subtotal * 0.18, 2)
     total = round(subtotal + tax, 2)
 
-    # Store transaction
-    conn.execute("""INSERT INTO transactions (id, cashier_id, cashier_name, items, subtotal, tax, total,
-        payment_method, status, fraud_status, fraud_reason, system_snapshot)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (txn_id, user_id, session["username"], json.dumps(items), subtotal, tax, total,
-         data.get("payment_method", "card"), "pending", decision, reason, json.dumps(snapshot)))
+    # Store transaction record
+    conn.execute(
+        """INSERT INTO transactions
+           (id, cashier_id, cashier_name, items, subtotal, tax, total,
+            payment_method, status, fraud_status, fraud_reason, system_snapshot)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (txn_id, user_id, session["username"], json.dumps(items),
+         subtotal, tax, total, data.get("payment_method", "card"),
+         "pending", decision, reason, json.dumps(snapshot))
+    )
     conn.commit()
     conn.close()
 
     log_event("TRANSACTION_INITIATED", txn_id, user_id, f"Decision: {decision} | {reason}")
 
-    # Emit real-time event
+    # Emit real-time event to dashboard
     socketio.emit("transaction_event", {
-        "txn_id": txn_id, "decision": decision, "reason": reason,
-        "total": total, "snapshot": snapshot
+        "txn_id": txn_id,
+        "decision": decision,
+        "reason": reason,
+        "total": total,
+        "snapshot": snapshot
     })
 
     return jsonify({
@@ -377,6 +403,7 @@ def initiate_transaction():
 def create_razorpay_order():
     data = request.get_json()
     txn_id = data.get("txn_id")
+
     conn = get_db()
     txn = conn.execute("SELECT * FROM transactions WHERE id=?", (txn_id,)).fetchone()
     if not txn or txn["fraud_status"] != "allow":
@@ -391,19 +418,37 @@ def create_razorpay_order():
             "amount": amount_paise,
             "currency": "INR",
             "receipt": txn_id[:20],
-            "notes": {"txn_id": txn_id, "cashier": txn["cashier_name"]}
+            "notes": {
+                "txn_id": txn_id,
+                "cashier": txn["cashier_name"]
+            }
         })
-        conn.execute("UPDATE transactions SET razorpay_order_id=? WHERE id=?", (order["id"], txn_id))
+        conn.execute(
+            "UPDATE transactions SET razorpay_order_id=? WHERE id=?",
+            (order["id"], txn_id)
+        )
         conn.commit()
         conn.close()
-        return jsonify({"order_id": order["id"], "amount": amount_paise, "key": RAZORPAY_KEY_ID})
+        return jsonify({
+            "order_id": order["id"],
+            "amount": amount_paise,
+            "key": RAZORPAY_KEY_ID
+        })
     except Exception as e:
-        # Fallback: simulate order for demo
+        # Fallback demo mode if Razorpay fails
         sim_order_id = "order_" + str(uuid.uuid4())[:16]
-        conn.execute("UPDATE transactions SET razorpay_order_id=? WHERE id=?", (sim_order_id, txn_id))
+        conn.execute(
+            "UPDATE transactions SET razorpay_order_id=? WHERE id=?",
+            (sim_order_id, txn_id)
+        )
         conn.commit()
         conn.close()
-        return jsonify({"order_id": sim_order_id, "amount": amount_paise, "key": RAZORPAY_KEY_ID, "demo": True})
+        return jsonify({
+            "order_id": sim_order_id,
+            "amount": amount_paise,
+            "key": RAZORPAY_KEY_ID,
+            "demo": True
+        })
 
 @app.route("/api/transaction/complete", methods=["POST"])
 @login_required
@@ -418,15 +463,19 @@ def complete_transaction():
         conn.close()
         return jsonify({"error": "Transaction not found"}), 404
 
-    # Deduct inventory
+    # Deduct inventory for each item
     items = json.loads(txn["items"])
     for item in items:
-        conn.execute("UPDATE products SET stock = stock - ? WHERE id=? AND stock >= ?",
-                     (item["qty"], item["id"], item["qty"]))
+        conn.execute(
+            "UPDATE products SET stock = stock - ? WHERE id=? AND stock >= ?",
+            (item["qty"], item["id"], item["qty"])
+        )
 
-    conn.execute("""UPDATE transactions SET status='completed', razorpay_payment_id=?,
-        completed_at=? WHERE id=?""",
-        (payment_id, datetime.utcnow().isoformat(), txn_id))
+    conn.execute(
+        """UPDATE transactions SET status='completed', razorpay_payment_id=?,
+           completed_at=? WHERE id=?""",
+        (payment_id, datetime.utcnow().isoformat(), txn_id)
+    )
     conn.commit()
     conn.close()
 
@@ -441,7 +490,10 @@ def release_hold():
     data = request.get_json()
     txn_id = data.get("txn_id")
     conn = get_db()
-    conn.execute("UPDATE transactions SET fraud_status='allow', fraud_reason='Hold released by supervisor' WHERE id=?", (txn_id,))
+    conn.execute(
+        "UPDATE transactions SET fraud_status='allow', fraud_reason='Hold released by supervisor' WHERE id=?",
+        (txn_id,)
+    )
     conn.commit()
     conn.close()
     log_event("HOLD_RELEASED", txn_id, session["user_id"], "Transaction hold released")
@@ -455,24 +507,46 @@ def dashboard_stats():
     conn = get_db()
     today = datetime.utcnow().date().isoformat()
 
-    total_sales = conn.execute("SELECT COALESCE(SUM(total),0) as s FROM transactions WHERE status='completed' AND DATE(created_at)=?", (today,)).fetchone()["s"]
-    total_txns = conn.execute("SELECT COUNT(*) as c FROM transactions WHERE DATE(created_at)=?", (today,)).fetchone()["c"]
-    blocked = conn.execute("SELECT COUNT(*) as c FROM transactions WHERE fraud_status='block' AND DATE(created_at)=?", (today,)).fetchone()["c"]
-    held = conn.execute("SELECT COUNT(*) as c FROM transactions WHERE fraud_status='hold' AND DATE(created_at)=?", (today,)).fetchone()["c"]
+    total_sales = conn.execute(
+        "SELECT COALESCE(SUM(total),0) as s FROM transactions WHERE status='completed' AND DATE(created_at)=?",
+        (today,)
+    ).fetchone()["s"]
 
-    recent = conn.execute("""SELECT t.*, u.username FROM transactions t
-        LEFT JOIN users u ON t.cashier_id=u.id
-        ORDER BY t.created_at DESC LIMIT 20""").fetchall()
+    total_txns = conn.execute(
+        "SELECT COUNT(*) as c FROM transactions WHERE DATE(created_at)=?",
+        (today,)
+    ).fetchone()["c"]
 
-    # Weekly sales
+    blocked = conn.execute(
+        "SELECT COUNT(*) as c FROM transactions WHERE fraud_status='block' AND DATE(created_at)=?",
+        (today,)
+    ).fetchone()["c"]
+
+    held = conn.execute(
+        "SELECT COUNT(*) as c FROM transactions WHERE fraud_status='hold' AND DATE(created_at)=?",
+        (today,)
+    ).fetchone()["c"]
+
+    recent = conn.execute(
+        """SELECT t.*, u.username FROM transactions t
+           LEFT JOIN users u ON t.cashier_id=u.id
+           ORDER BY t.created_at DESC LIMIT 20"""
+    ).fetchall()
+
+    # Weekly sales for chart
     weekly = []
     for i in range(6, -1, -1):
         d = (datetime.utcnow() - timedelta(days=i)).date().isoformat()
-        s = conn.execute("SELECT COALESCE(SUM(total),0) as s FROM transactions WHERE status='completed' AND DATE(created_at)=?", (d,)).fetchone()["s"]
+        s = conn.execute(
+            "SELECT COALESCE(SUM(total),0) as s FROM transactions WHERE status='completed' AND DATE(created_at)=?",
+            (d,)
+        ).fetchone()["s"]
         weekly.append({"date": d, "sales": s})
 
-    # Top products
-    top_prods = conn.execute("SELECT name, stock, category FROM products ORDER BY stock ASC LIMIT 5").fetchall()
+    # Low stock products
+    top_prods = conn.execute(
+        "SELECT name, stock, category FROM products ORDER BY stock ASC LIMIT 5"
+    ).fetchall()
 
     conn.close()
     return jsonify({
@@ -489,7 +563,9 @@ def dashboard_stats():
 @login_required
 def all_transactions():
     conn = get_db()
-    txns = conn.execute("""SELECT * FROM transactions ORDER BY created_at DESC LIMIT 100""").fetchall()
+    txns = conn.execute(
+        "SELECT * FROM transactions ORDER BY created_at DESC LIMIT 100"
+    ).fetchall()
     conn.close()
     return jsonify([dict(t) for t in txns])
 
@@ -497,7 +573,9 @@ def all_transactions():
 @login_required
 def get_logs():
     conn = get_db()
-    logs = conn.execute("SELECT * FROM system_logs ORDER BY created_at DESC LIMIT 50").fetchall()
+    logs = conn.execute(
+        "SELECT * FROM system_logs ORDER BY created_at DESC LIMIT 50"
+    ).fetchall()
     conn.close()
     return jsonify([dict(l) for l in logs])
 
@@ -506,7 +584,10 @@ def get_logs():
 def get_system_state():
     conn = get_db()
     dev = conn.execute("SELECT * FROM devices WHERE device_id='DEV-001'").fetchone()
-    sess = conn.execute("SELECT * FROM sessions WHERE user_id=? AND active=1 ORDER BY started_at DESC LIMIT 1", (session["user_id"],)).fetchone()
+    sess = conn.execute(
+        "SELECT * FROM sessions WHERE user_id=? AND active=1 ORDER BY started_at DESC LIMIT 1",
+        (session["user_id"],)
+    ).fetchone()
     user = conn.execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
     conn.close()
 
@@ -533,8 +614,10 @@ def get_system_state():
 # ── Logging ────────────────────────────────────────────────────────────────────
 def log_event(event_type, txn_id, user_id, detail):
     conn = get_db()
-    conn.execute("INSERT INTO system_logs (event_type, transaction_id, user_id, detail) VALUES (?,?,?,?)",
-                 (event_type, txn_id, user_id, detail))
+    conn.execute(
+        "INSERT INTO system_logs (event_type, transaction_id, user_id, detail) VALUES (?,?,?,?)",
+        (event_type, txn_id, user_id, detail)
+    )
     conn.commit()
     conn.close()
 
@@ -543,6 +626,9 @@ def log_event(event_type, txn_id, user_id, detail):
 def on_connect():
     emit("system_state", {"status": "connected", "time": datetime.utcnow().isoformat()})
 
+# ── Startup ────────────────────────────────────────────────────────────────────
+init_db()
+
 if __name__ == "__main__":
-    init_db()
-    socketio.run(app, debug=True, host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    socketio.run(app, host="0.0.0.0", port=port, allow_unsafe_werkzeug=True)
