@@ -11,8 +11,8 @@ app.secret_key = os.environ.get("SECRET_KEY", "smartpos-secret-key-2024")
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 DB_PATH = "instance/smartpos.db"
-RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "rzp_live_ShEPK3J0E4soEZ")
-RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "rnTA9ro5CgLfYNiTLQaMWs0d")
+RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "rzp_live_ShOMKQSkMkk7Qi")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "ZCvy0VclTfqXuST0utrsMuBQ")
 
 # ── Database ────────────────────────────────────────────────────────────────
 def get_db():
